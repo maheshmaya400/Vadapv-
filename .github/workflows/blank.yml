@@ -1,146 +1,128 @@
-name: Ubuntu VPS
-on: [workflow_dispatch]
-jobs:
-  vps:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install ngrok
-        run: |
-          wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip
-          unzip -q ngrok-v3-stable-linux-amd64.zip
-      - name: Authenticate ngrok
-        run: ./ngrok authtoken $NGROK_AUTH_TOKEN
-        env:
-          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
-      - name: Enable SSH & set password
-        run: |
-          sudo systemctl start ssh
-          echo "runner:password123" | sudo chpasswd
-      - name: Start ngrok tunnel
-        run: |
-          ./ngrok tcp 22 > ngrok.log &
-          sleep 5
-      - name: Print SSH command
-        run: |
-          echo "=============================="
-          echo "Username: runner"
-          echo "Password: password123"
-          grep -o 'tcp://.*' ngrok.log | sed 's#tcp://#ssh runner@#' | sed 's#:# -p #'
-          echo "=============================="
-      - name: Keep alive
-        run: sleep 21600
 
-
------------------
-
-name: Windows VPS
+name: Ubuntu VPS SSH
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  vps:
-    runs-on: windows-latest
+  ubuntu-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
-      - name: Download ngrok
-        shell: pwsh
+      - name: Install dependencies
+        shell: bash
         run: |
-          Invoke-WebRequest `
-            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
-            -OutFile "ngrok.zip"
+          sudo apt-get update
+          sudo apt-get install -y \
+            openssh-server \
+            curl \
+            jq \
+            unzip
 
-          Expand-Archive ngrok.zip -DestinationPath . -Force
-
-          if (!(Test-Path ".\ngrok.exe")) {
-            Write-Error "ngrok.exe not found!"
+      - name: Configure SSH access
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo "SSH_PUBLIC_KEY secret is missing"
             exit 1
-          }
+          fi
 
-      - name: Show ngrok version
-        shell: pwsh
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" \
+            >> "$HOME/.ssh/authorized_keys"
+
+          chmod 600 "$HOME/.ssh/authorized_keys"
+
+          sudo tee /etc/ssh/sshd_config.d/99-vps.conf > /dev/null <<EOF
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          AllowUsers runner
+          EOF
+
+          sudo sshd -t
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
+
+      - name: Install ngrok
+        shell: bash
         run: |
-          .\ngrok.exe version
+          curl -fsSL \
+            https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip \
+            -o ngrok.zip
+
+          unzip -q ngrok.zip
+          sudo install ngrok /usr/local/bin/ngrok
+
+          ngrok version
 
       - name: Authenticate ngrok
-        shell: pwsh
+        shell: bash
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          .\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
-
-      - name: Enable RDP
-        shell: pwsh
-        run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
-            -Value 0
-
-          $user = $env:USERNAME
-
-          net user $user "Password123!"
-          net localgroup "Remote Desktop Users" $user /add
-
-          Write-Host "User: $user"
-
-      - name: Start ngrok
-        shell: pwsh
-        run: |
-          Start-Process `
-            -FilePath ".\ngrok.exe" `
-            -ArgumentList "tcp","3389" `
-            -WindowStyle Hidden
-
-      - name: Get Tunnel Information
-        shell: pwsh
-        run: |
-          Write-Host "Waiting for ngrok tunnel..."
-
-          $tunnel = $null
-
-          for ($i = 0; $i -lt 40; $i++) {
-            Start-Sleep -Seconds 5
-
-            try {
-              $res = Invoke-RestMethod `
-                -Uri "http://127.0.0.1:4040/api/tunnels"
-
-              if ($res.tunnels.Count -gt 0) {
-                $tunnel = $res.tunnels[0].public_url
-                break
-              }
-            }
-            catch {
-              Write-Host "Waiting..."
-            }
-          }
-
-          if (-not $tunnel) {
-            Write-Error "Failed to obtain ngrok tunnel."
+          if [ -z "$NGROK_AUTH_TOKEN" ]; then
+            echo "NGROK_AUTH_TOKEN secret is missing"
             exit 1
-          }
+          fi
 
-          $addr = $tunnel.Replace("tcp://", "")
-          $parts = $addr.Split(":")
+          ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
 
-          Write-Host ""
-          Write-Host "=================================="
-          Write-Host "USERNAME : $env:USERNAME"
-          Write-Host "PASSWORD : Password123!"
-          Write-Host "HOST     : $($parts[0])"
-          Write-Host "PORT     : $($parts[1])"
-          Write-Host "RDP      : $addr"
-          Write-Host "=================================="
-
-      - name: Keep Runner Alive
-        shell: pwsh
+      - name: Start SSH tunnel
+        shell: bash
         run: |
-          Start-Sleep -Seconds 21600
+          nohup ngrok tcp 22 --log=stdout \
+            > "$RUNNER_TEMP/ngrok.log" 2>&1 &
+
+          echo $! > "$RUNNER_TEMP/ngrok.pid"
+
+          TUNNEL=""
+
+          for i in $(seq 1 40); do
+            TUNNEL=$(curl -fsS \
+              http://127.0.0.1:4040/api/tunnels \
+              | jq -r \
+              '.tunnels[]? | select(.proto=="tcp") | .public_url' \
+              | head -n 1 || true)
+
+            if [ -n "$TUNNEL" ]; then
+              break
+            fi
+
+            sleep 3
+          done
+
+          if [ -z "$TUNNEL" ]; then
+            echo "Could not establish ngrok tunnel"
+            cat "$RUNNER_TEMP/ngrok.log"
+            exit 1
+          fi
+
+          ADDRESS="${TUNNEL#tcp://}"
+          HOST="${ADDRESS%:*}"
+          PORT="${ADDRESS##*:}"
+
+          echo "HOST=$HOST" >> "$GITHUB_OUTPUT"
+          echo "PORT=$PORT" >> "$GITHUB_OUTPUT"
+
+          echo "=================================="
+          echo "Ubuntu VPS is ready!"
+          echo "Username: runner"
+          echo "Host: $HOST"
+          echo "Port: $PORT"
+          echo "=================================="
+
+      - name: Keep VPS alive
+        shell: bash
+        run: |
+          echo "Ubuntu VPS running..."
+          sleep 21000
