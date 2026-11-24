@@ -1,0 +1,146 @@
+name: Ubuntu VPS
+on: [workflow_dispatch]
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ngrok
+        run: |
+          wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip
+          unzip -q ngrok-v3-stable-linux-amd64.zip
+      - name: Authenticate ngrok
+        run: ./ngrok authtoken $NGROK_AUTH_TOKEN
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      - name: Enable SSH & set password
+        run: |
+          sudo systemctl start ssh
+          echo "runner:password123" | sudo chpasswd
+      - name: Start ngrok tunnel
+        run: |
+          ./ngrok tcp 22 > ngrok.log &
+          sleep 5
+      - name: Print SSH command
+        run: |
+          echo "=============================="
+          echo "Username: runner"
+          echo "Password: password123"
+          grep -o 'tcp://.*' ngrok.log | sed 's#tcp://#ssh runner@#' | sed 's#:# -p #'
+          echo "=============================="
+      - name: Keep alive
+        run: sleep 21600
+
+
+-----------------
+
+name: Windows VPS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  vps:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download ngrok
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+            -OutFile "ngrok.zip"
+
+          Expand-Archive ngrok.zip -DestinationPath . -Force
+
+          if (!(Test-Path ".\ngrok.exe")) {
+            Write-Error "ngrok.exe not found!"
+            exit 1
+          }
+
+      - name: Show ngrok version
+        shell: pwsh
+        run: |
+          .\ngrok.exe version
+
+      - name: Authenticate ngrok
+        shell: pwsh
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          .\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
+
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 0
+
+          $user = $env:USERNAME
+
+          net user $user "Password123!"
+          net localgroup "Remote Desktop Users" $user /add
+
+          Write-Host "User: $user"
+
+      - name: Start ngrok
+        shell: pwsh
+        run: |
+          Start-Process `
+            -FilePath ".\ngrok.exe" `
+            -ArgumentList "tcp","3389" `
+            -WindowStyle Hidden
+
+      - name: Get Tunnel Information
+        shell: pwsh
+        run: |
+          Write-Host "Waiting for ngrok tunnel..."
+
+          $tunnel = $null
+
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 5
+
+            try {
+              $res = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:4040/api/tunnels"
+
+              if ($res.tunnels.Count -gt 0) {
+                $tunnel = $res.tunnels[0].public_url
+                break
+              }
+            }
+            catch {
+              Write-Host "Waiting..."
+            }
+          }
+
+          if (-not $tunnel) {
+            Write-Error "Failed to obtain ngrok tunnel."
+            exit 1
+          }
+
+          $addr = $tunnel.Replace("tcp://", "")
+          $parts = $addr.Split(":")
+
+          Write-Host ""
+          Write-Host "=================================="
+          Write-Host "USERNAME : $env:USERNAME"
+          Write-Host "PASSWORD : Password123!"
+          Write-Host "HOST     : $($parts[0])"
+          Write-Host "PORT     : $($parts[1])"
+          Write-Host "RDP      : $addr"
+          Write-Host "=================================="
+
+      - name: Keep Runner Alive
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 21600
